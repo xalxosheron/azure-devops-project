@@ -1,0 +1,144 @@
+name: Build and Deploy to AKS
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:  # Allows manual trigger
+
+env:
+  IMAGE_NAME: webapp
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    
+    outputs:
+      image-tag: ${{ steps.set-tag.outputs.tag }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set image tag
+        id: set-tag
+        run: |
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          echo "tag=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "Building image with tag: ${SHORT_SHA}"
+      
+      - name: Log in to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: Log in to Azure Container Registry
+        run: |
+          echo "Logging in to ACR: ${{ secrets.ACR_LOGIN_SERVER }}"
+          az acr login --name ${{ secrets.ACR_NAME }}
+      
+      - name: Build Docker image
+        run: |
+          echo "Building image..."
+          docker build -t ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ steps.set-tag.outputs.tag }} .
+          docker tag ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ steps.set-tag.outputs.tag }} \
+                     ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest
+      
+      - name: Push Docker image to ACR
+        run: |
+          echo "Pushing image with tag: ${{ steps.set-tag.outputs.tag }}"
+          docker push ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ steps.set-tag.outputs.tag }}
+          docker push ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest
+          echo "✅ Image pushed successfully!"
+      
+      - name: Verify image in ACR
+        run: |
+          echo "Verifying image in ACR..."
+          az acr repository show-tags --name ${{ secrets.ACR_NAME }} --repository ${{ env.IMAGE_NAME }} --output table
+
+  deploy-to-aks:
+    name: Deploy to Azure Kubernetes Service
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Log in to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+      
+      - name: Get AKS credentials
+        run: |
+          echo "Getting AKS credentials..."
+          az aks get-credentials \
+            --resource-group ${{ secrets.RESOURCE_GROUP }} \
+            --name ${{ secrets.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
+          
+          echo "✅ Connected to AKS cluster"
+          kubectl cluster-info
+      
+      - name: Update deployment manifest
+        run: |
+          echo "Updating deployment manifest..."
+          IMAGE_TAG=${{ needs.build-and-push.outputs.image-tag }}
+          
+          sed -i "s|image:.*|image: ${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${IMAGE_TAG}|g" kubernetes/deployment.yaml
+          
+          echo "Updated deployment.yaml:"
+          cat kubernetes/deployment.yaml | grep "image:"
+      
+      - name: Deploy to AKS
+        run: |
+          echo "Deploying to Kubernetes..."
+          kubectl apply -f kubernetes/deployment.yaml
+          kubectl apply -f kubernetes/service.yaml
+          echo "✅ Manifests applied"
+      
+      - name: Wait for deployment rollout
+        run: |
+          echo "Waiting for deployment to complete..."
+          kubectl rollout status deployment/webapp-deployment --timeout=5m
+          echo "✅ Deployment completed successfully!"
+      
+      - name: Verify deployment
+        run: |
+          echo "================================================"
+          echo "DEPLOYMENT VERIFICATION"
+          echo "================================================"
+          
+          echo ""
+          echo "📦 Deployments:"
+          kubectl get deployments -l app=webapp
+          
+          echo ""
+          echo "🎯 Pods:"
+          kubectl get pods -l app=webapp -o wide
+          
+          echo ""
+          echo "🌐 Services:"
+          kubectl get service webapp-service
+          
+          echo ""
+          echo "🔍 Getting External IP..."
+          EXTERNAL_IP=$(kubectl get service webapp-service -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          
+          if [ -n "$EXTERNAL_IP" ]; then
+            echo "================================================"
+            echo "✅ DEPLOYMENT SUCCESSFUL!"
+            echo "🌐 Application URL: http://${EXTERNAL_IP}"
+            echo "================================================"
+          else
+            echo "⏳ External IP is being provisioned..."
+            echo "Run: kubectl get service webapp-service"
+          fi
+      
+      - name: Display application logs
+        if: always()
+        run: |
+          echo ""
+          echo "📋 Recent application logs:"
+          kubectl logs -l app=webapp --tail=30 || true
