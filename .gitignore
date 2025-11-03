@@ -14,6 +14,8 @@ env/
 .terraform/
 *.tfvars.backup
 .terraform.lock.hcl
+*.tfplan
+
 
 # IDEs
 .vscode/
